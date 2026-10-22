@@ -1,67 +1,65 @@
-# Async credit service
+# Technical Design Document: Async Credit Processing Service
 
-A client submits a credit and gets a task id immediately. The balance changes later, on a worker, and a repeated delivery of that same task must not add the money twice. The service is four processes: a FastAPI API, a Celery worker, Redis, and MongoDB. The API and the worker are the same Python application, started with different commands from one image.
+- **Author:** Liem Do
+- **Status:** Implemented
+- **Target audience:** Engineering reviewers / tech leads
 
-## Architecture
+## 1. Overview and objectives
 
-The API accepts the credit, records it, and enqueues work. Redis carries the task. The worker applies it. MongoDB holds both the credit and the balance, and it is the only place a client looks to see whether the credit finished. Celery has no result backend.
+The service accepts a credit over HTTP and updates the user's balance on a worker. The API returns once the credit is stored and queued. A redelivered task must not add the money twice.
 
-```mermaid
-sequenceDiagram
-  participant Client
-  participant API as FastAPI
-  participant Mongo
-  participant Redis
-  participant Worker as CeleryWorker
+- The API returns **202 Accepted** with a `task_id` after the credit is stored as `processing`.
+- A Celery worker, with Redis as the broker, executes the credit. Delivery is at-least-once. The balance update is exactly once.
+- The transition `processing` → `processed` is committed in one MongoDB transaction with the balance increment.
 
-  Client->>API: POST /credits
-  API->>Mongo: insert credit status=processing
-  API->>Redis: enqueue apply_credit
-  API-->>Client: 202 task_id
-  Redis->>Worker: deliver task
-  Worker->>Mongo: transaction $inc balance and set processed
+Clients read MongoDB for the outcome. `GET /credits/{task_id}` returns the credit. `GET /users/{user_id}` returns the committed balance.
+
+## 2. Architecture and system flow
+
+Four processes share the work. The API and the worker are one Python application, started with different commands from one image.
+
+1. Client → `POST /credits` → FastAPI.
+2. FastAPI validates the body, inserts a `credits` document with `status: "processing"`, and publishes `credits.apply_credit` to Redis.
+3. FastAPI returns **202 Accepted** with `task_id`.
+4. The Celery worker pulls the task, increments `users.balance` with `$inc`, and sets the credit to `processed` in the same transaction.
+
+**API.** FastAPI on Python 3.11+ and Pydantic. Routes call `CreditApplication` and do not update the balance.
+
+**Queue.** Redis and Celery, with no result backend. The worker acknowledges late, returns a task if the process dies, and prefetches one message.
+
+**Datastore.** MongoDB holds `users` and `credits`. Compose runs replica set `rs0` so the balance update can be a multi-document transaction.
+
+## 3. Key design decisions and rationale
+
+**Accept and apply are separate.** The request validates, inserts, and enqueues. The balance update does not hold the HTTP call. If Redis rejects the publish, the API marks that credit `failed` and returns **503**.
+
+**Status lives on the credit. The balance lives on the user.** Two credits for one user can be in flight together. One user document cannot hold both statuses, so the second write would replace the first and a retry could apply the wrong amount. Each credit is its own document (`processing`, `processed`, or `failed`). The user document stores `user_id` and `balance` only and is created on the first successful credit. `failed` means the credit will not be applied.
+
+**Redelivery does not double-credit.** Celery can deliver a task more than once. Inside the transaction, the worker updates the credit only when its status is still `processing`, then `$inc`s the balance. The worker that loses that update aborts and does not increment. A later delivery of a `processed` or `failed` credit is a no-op.
+
+**The idempotency key covers client retries, not worker retries.** An optional `Idempotency-Key` header with the same body returns the original task and does not publish again, including when that task `failed`. The same key with a different body returns **409**. A second POST without the header is a second credit.
+
+## 4. Implementation approach
+
+`POST /credits` accepts `{ "user_id": "u_123", "amount": "150.00" }` and returns **202** `{ "task_id": "<uuid>", "status": "processing" }`. `amount` is a decimal string, greater than zero, at most `1000000.00`, with at most two decimal places. `user_id` is 1–128 characters from letters, digits, `_`, and `-`. Invalid input returns **422**.
+
+```json
+{ "user_id": "u_123", "balance": "150.00" }
+{ "task_id": "<uuid>", "user_id": "u_123", "amount": "150.00", "status": "processed" }
 ```
 
-`POST /credits` validates `user_id` and `amount`, inserts a credit with status `processing`, and publishes `credits.apply_credit` with that task id. The response is 202. The client then calls `GET /credits/{task_id}` until the status is `processed` or `failed`, and `GET /users/{user_id}` to read the committed balance.
+The first document is the user. The second is the credit. Status is on the credit. Indexes: unique `user_id` on `users`, unique sparse `idempotency_key` on `credits`, and `user_id` on `credits`.
 
-The worker loads the credit and, in one MongoDB transaction, increments the user's balance and sets the credit to `processed`. The user document is created on that first successful credit. A credit that is already `processed` or `failed` is left alone.
+`accept` inserts the processing credit and publishes. A duplicate key returns the original row. `apply` runs the transaction only while the credit is `processing`. The task calls `apply`. Database and network errors retry up to five times with exponential backoff. Any other error, or the last retry, sets `failed` only while the credit is still `processing`. A crash after the insert and before publish can leave a credit `processing` with nothing queued. There is no sweeper for that gap.
 
-## Components
+## 5. Testing strategy
 
-**API.** FastAPI routes in `app/api` validate input and map failures to HTTP. `POST /credits` returns 202, 409, 422, or 503. `GET /credits/{task_id}` and `GET /users/{user_id}` return the stored credit or balance, or 404. `GET /health` reports MongoDB and Redis and returns 503 when either is down. Domain errors become those status codes in one place (`app/api/errors.py`), so a route does not build error bodies itself.
+**Unit tests** (`pytest`) build `CreditApplication` on in-memory repositories, a publisher, and a unit of work. They cover one apply, a no-op second apply, idempotent replay and **409**, invalid input, a broker failure, a lost claim, and a database error during apply. A non-retryable worker error is marked `failed` immediately. A first-attempt network error stays `processing`. Route tests check **202**, **422**, **404**, and **503** without MongoDB.
 
-**Credit service.** `CreditApplication` in `app/services/credits.py` is the use case both the API and the worker call. `accept` stores the credit and publishes it. `apply` performs the balance update. The HTTP layer and the Celery task stay thin so the rules live in one class.
+**Integration tests** use Compose MongoDB and Redis and write to `credits_test`. They POST through the real repositories, then apply in process, except one test that publishes to Redis. They check a single balance update, idempotency, publish failure, and health.
 
-**Persistence.** `MongoCreditRepository` and `MongoUserRepository` read and write the `credits` and `users` collections. `MongoUnitOfWork` opens the transaction that `apply` uses. Indexes are a unique `user_id` on users, a unique sparse `idempotency_key` on credits, and `user_id` on credits.
+## 6. Trade-offs and future work
 
-**Broker and worker.** `CeleryTaskPublisher` calls `apply_credit.delay`. The task in `app/tasks.py` calls `CreditApplication.apply` and decides whether a failure should be retried or recorded. Redis is the broker only.
+Redis is the broker because this workload is one task type with retries. RabbitMQ or Kafka would add operational weight without a routing or retention need here.
 
-**MongoDB.** Two collections, not one. `users` stores `user_id` and `balance`. `credits` stores `task_id`, `user_id`, `amount`, `status` (`processing`, `processed`, or `failed`), an optional `idempotency_key`, timestamps, and an optional `error`. Compose runs MongoDB as a single-node replica set, `rs0`, because the balance update is a multi-document transaction.
-
-## Design decisions
-
-Status lives on the credit, and the balance lives on the user. Two credits for the same user can be `processing` at the same time. Each has its own document, so one credit's status cannot replace the other's, and a retry of one task cannot apply the other credit.
-
-The increment and the status change commit together. The update from `processing` to `processed` matches only a credit that is still `processing`. If two workers take the same task, one update matches and that worker increments the balance. The other finds the credit already moved, aborts the transaction, and does not increment. Celery is at-least-once, so this conditional update is the exactly-once guard. The worker acknowledges late, returns the task to the queue if the process dies, and prefetches one message.
-
-`failed` is an extra status so a credit that will never be applied is visible. Database and network errors retry up to five times with backoff. Any other error, or a retryable error after that budget, sets `failed` and acknowledges the message. The balance is unchanged.
-
-`Idempotency-Key` is optional. The same key and body return the original task, including a failed one, and do not publish a second time. The same key with a different body returns 409. A second POST without the header is a second credit.
-
-If Redis rejects the publish, the API sets that credit to `failed` and returns 503, so the client can tell the credit was not queued. A crash after the insert and before the publish can still leave a credit in `processing` with nothing on the queue. There is no sweeper for that gap. The API and the worker use a synchronous MongoDB driver because the worker is synchronous. An async driver would fight that process.
-
-## Implementation approach
-
-The code follows the request inward. Routes depend on a `CreditService`. `app/api/deps.py` builds `CreditApplication` with the MongoDB repositories, the Celery publisher, and a unit-of-work factory. Tests replace that publisher, or the whole service, without changing the routes.
-
-`accept` checks for an existing idempotency key, inserts the processing credit, and publishes. A duplicate key from a concurrent insert loads the original credit and returns it. `apply` reads the credit, returns immediately when it is missing or no longer `processing`, and otherwise runs the transaction. Repositories do not know about HTTP or Celery. The task does not contain the balance rules. It calls `apply`, and on failure it either lets Celery retry or calls `mark_failed`.
-
-Configuration is `MONGODB_URI`, `MONGODB_DATABASE`, `REDIS_URL`, and `PORT`. Compose starts `api`, `worker`, `mongo`, and `redis`. The API command is uvicorn. The worker command is `celery -A app.tasks worker`.
-
-## Testing
-
-Tests are split so the credit rules can fail without a database, and the MongoDB behavior can still be checked against a real server.
-
-Unit tests build `CreditApplication` with in-memory credit and user repositories, a publisher that records task ids or raises, and a unit of work that records commit and abort. They cover the success path: accept publishes one processing credit, apply adds the amount once, a second apply does not add it again, and the same idempotency key returns the original task. They also cover invalid amounts and user ids, an idempotency conflict, a broker outage that marks the credit failed, a lost claim that aborts without incrementing, a database error during apply, and the worker's choice to fail a non-retryable error immediately while leaving a retryable error in `processing`. A small FastAPI app with the real routes and exception handlers checks 202, 422, 404, and 503 without opening MongoDB.
-
-Integration tests use the Compose MongoDB and Redis and write to the `credits_test` database. They drive `POST /credits` through the real repositories. Most of them substitute a recording publisher and then call `apply` in process, so the suite does not wait on a worker. One test publishes to the real broker. Together they check validation, a balance that increases once, idempotent replay and conflict, a publish failure that returns 503 and stores `failed`, unknown ids, and health.
+Clients poll `GET /credits/{task_id}`. A webhook or WebSocket could replace that poll later. The balance is one `$inc` on the user. A ledger of immutable entries would make an audit and a reversal easier, and the conditional credit update would still be required so a redelivery does not append the same entry twice.
