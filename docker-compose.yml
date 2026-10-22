@@ -1,0 +1,53 @@
+services:
+  mongo:
+    image: mongo:7
+    hostname: mongo
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./docker/mongo-rs-healthcheck.js:/mongo-rs-healthcheck.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--file", "/mongo-rs-healthcheck.js"]
+      interval: 5s
+      timeout: 20s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGODB_DATABASE: credits
+      REDIS_URL: redis://redis:6379/0
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: celery -A app.tasks worker --loglevel=info --concurrency=1
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGODB_DATABASE: credits
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
