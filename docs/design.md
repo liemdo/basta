@@ -52,9 +52,49 @@ sequenceDiagram
 
 ## 4. Implementation approach
 
-`POST /credits` accepts `{ "user_id": "u_123", "amount": "150.00" }` and returns **202** `{ "task_id": "<uuid>", "status": "processing" }`. `amount` is a decimal string, greater than zero, at most `1000000.00`, with at most two decimal places. `user_id` is 1–128 characters from letters, digits, `_`, and `-`. Invalid input returns **422**.
+`POST /credits` accepts this body and returns **202**. `amount` is a decimal string, greater than zero, at most `1000000.00`, with at most two decimal places. `user_id` is 1–128 characters from letters, digits, `_`, and `-`. Invalid input returns **422**.
 
-User `{ "user_id": "u_123", "balance": "150.00" }`. Credit `{ "task_id": "<uuid>", "user_id": "u_123", "amount": "150.00", "status": "processed" }`. Indexes are a unique `user_id` on users, a unique sparse `idempotency_key` on credits, and `user_id` on credits.
+Request:
+
+```json
+{
+  "user_id": "u_123",
+  "amount": "150.00"
+}
+```
+
+Response:
+
+```json
+{
+  "task_id": "<uuid>",
+  "status": "processing"
+}
+```
+
+The user document holds the balance. The credit document holds the status.
+
+`users`:
+
+```json
+{
+  "user_id": "u_123",
+  "balance": "150.00"
+}
+```
+
+`credits`:
+
+```json
+{
+  "task_id": "<uuid>",
+  "user_id": "u_123",
+  "amount": "150.00",
+  "status": "processed"
+}
+```
+
+Indexes are a unique `user_id` on users, a unique sparse `idempotency_key` on credits, and `user_id` on credits.
 
 `accept` inserts the processing credit and publishes. A duplicate key returns the original row. `apply` runs the transaction only while the credit is `processing`. The task calls `apply`. Database and network errors retry up to five times with exponential backoff. Any other error, or the last retry, sets `failed` only while the credit is still `processing`. A crash after the insert and before publish can leave a credit `processing` with nothing queued. Nothing sweeps that gap.
 
@@ -66,4 +106,8 @@ User `{ "user_id": "u_123", "balance": "150.00" }`. Credit `{ "task_id": "<uuid>
 
 ## 6. Trade-offs and future work
 
-Redis is the broker because this workload is one task type with retries. RabbitMQ or Kafka would add weight without a routing or retention need here. Clients poll `GET /credits/{task_id}`; a webhook or WebSocket could replace that later. A ledger of immutable entries would make an audit easier, and the conditional credit update would still be required so a redelivery does not append the same entry twice.
+Redis is the broker because this workload is one task type with retries. RabbitMQ or Kafka would add weight without a routing or retention need here.
+
+Clients poll `GET /credits/{task_id}`. A webhook or WebSocket could replace that poll later.
+
+A ledger of immutable entries would make an audit easier. The conditional credit update would still be required, so a redelivery does not append the same entry twice.
