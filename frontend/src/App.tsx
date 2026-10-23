@@ -144,12 +144,15 @@ export default function App() {
     if (submitting.current) return
     setUserError("")
     setAmountError("")
+    const submittedUserId = userId
     const nextAmount = sanitizeAmount(amount).replace(/\.$/, "")
-    setAmount(nextAmount)
     if (!(Number(nextAmount) > 0)) {
+      setAmount(nextAmount)
       setAmountError("Amount must be greater than 0.")
       return
     }
+    setUserId("")
+    setAmount("")
     submitting.current = true
     setBusy(true)
     try {
@@ -159,7 +162,7 @@ export default function App() {
           "content-type": "application/json",
           "Idempotency-Key": crypto.randomUUID(),
         },
-        body: JSON.stringify({ user_id: userId, amount: nextAmount }),
+        body: JSON.stringify({ user_id: submittedUserId, amount: nextAmount }),
       })
       const payload = (await response.json()) as ErrorPayload & { task_id?: string }
       if (!response.ok) {
@@ -222,7 +225,6 @@ export default function App() {
                 name="amount"
                 required
                 inputMode="decimal"
-                placeholder="25.00"
                 autoComplete="off"
                 value={amount}
                 aria-invalid={amountError ? true : undefined}
