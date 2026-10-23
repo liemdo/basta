@@ -48,6 +48,7 @@ Submitting a credit by hand, and pointing the app at your own MongoDB or Redis, 
 - **API**: FastAPI, Pydantic v2, Python 3.11
 - **Worker**: Celery 5. Redis is the broker. Celery stores no task result
 - **Database**: MongoDB. Balances are `Decimal128`. The apply step is one multi-document transaction, so MongoDB runs as a replica set
+- **Demo page**: React, Tailwind, and shadcn/ui, built into the API image
 - **Local runtime**: Docker Compose (`api`, `worker`, `mongo`, `redis`)
 - **Tests**: pytest. Unit tests use in-memory stand-ins. Integration tests use the Compose databases
 

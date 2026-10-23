@@ -1,3 +1,13 @@
+FROM node:24-slim AS frontend
+
+WORKDIR /src
+
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -8,6 +18,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY pyproject.toml README.md ./
 COPY app ./app
+COPY --from=frontend /src/dist ./frontend/dist
 
 RUN pip install --no-cache-dir .
 

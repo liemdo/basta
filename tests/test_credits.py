@@ -158,9 +158,8 @@ def test_health_and_demo_page(client: TestClient) -> None:
     page = client.get("/")
     assert page.status_code == 200
     assert "text/html" in page.headers["content-type"]
-    assert 'name="user_id"' in page.text
-    assert 'name="amount"' in page.text
-    assert "Add credit" in page.text
+    assert "<title>Credits</title>" in page.text
+    assert 'id="root"' in page.text
 
 
 def test_user_list_is_capped(client: TestClient) -> None:
