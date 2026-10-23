@@ -1,73 +1,60 @@
-# Async credit service
+# Async Credit Processing Service
 
-`POST /credits` stores a credit as `processing` and returns 202 with a task id. A Celery worker adds the amount to the user's balance and sets the credit to `processed`. Open [http://localhost:8000](http://localhost:8000) to submit a credit and see balances. There is no sign-in.
+Accept a credit over HTTP, return immediately, and add the amount to the user's balance on a worker. A repeated delivery of the same task does not add the money twice.
 
-The design is in [docs/design.md](docs/design.md). Request shapes are also at [http://localhost:8000/docs](http://localhost:8000/docs).
+Live demo: [https://basta-production-1b91.up.railway.app/](https://basta-production-1b91.up.railway.app/)
 
-## Run
+## Key Features
 
-Docker Compose runs the API, the worker, MongoDB, and Redis.
+- **Accept without waiting**: `POST /credits` stores the credit as `processing` and returns **202** with a `task_id`.
+- **Exactly-once balance update**: A Celery worker increments the balance and sets the credit to `processed` in one MongoDB transaction. A redelivery does not apply it again.
+- **Idempotency key**: The same `Idempotency-Key` and body return the original task. The same key with a different body returns **409**.
+- **Status you can poll**: `GET /credits/{task_id}` reads MongoDB, not a Celery result. Status is `processing`, `processed`, or `failed`.
+- **Demo page**: `/` submits a credit and lists committed balances. There is no sign-in.
 
-```bash
-docker compose up --build
-```
+## Getting Started
 
-The API listens on port 8000. `GET /health` returns 200 when MongoDB and Redis both answer, and 503 when either does not.
+### Prerequisites
 
-## Try a credit
+- Docker, for Compose
+- Python 3.11+, only if you run the API or the tests on the host
 
-`amount` is a decimal string. `"25.00"` is accepted. A JSON number such as `25.00` is rejected.
+### Installation
 
-```bash
-curl -s -X POST http://localhost:8000/credits \
-  -H 'content-type: application/json' \
-  -H 'Idempotency-Key: demo-1' \
-  -d '{"user_id":"u_123","amount":"25.00"}'
-```
+1. Start the API, the worker, MongoDB, and Redis:
 
-Poll the task, then read the balance. The balance is a string, for example `"25.00"`.
+   ```bash
+   docker compose up --build
+   ```
 
-```bash
-curl -s http://localhost:8000/credits/TASK_ID
-curl -s http://localhost:8000/users/u_123
-```
+2. Open [http://localhost:8000](http://localhost:8000). `GET /health` returns 200 when MongoDB and Redis both answer.
 
-The same `Idempotency-Key` and body return the original task. The same key with a different amount returns 409. A POST without the header creates another credit.
+3. Submit a credit. `amount` is a decimal string. A JSON number is rejected.
 
-## API
+   ```bash
+   curl -s -X POST http://localhost:8000/credits \
+     -H 'content-type: application/json' \
+     -H 'Idempotency-Key: demo-1' \
+     -d '{"user_id":"u_123","amount":"25.00"}'
+   ```
 
-| Method | Path | Result |
-| --- | --- | --- |
-| `POST` | `/credits` | 202 while `processing`. 409 when the idempotency key was used for a different body. 422 when the body is invalid. 503 when the task could not be queued. |
-| `GET` | `/credits/{task_id}` | Status, amount, and user. 404 when the task is unknown. |
-| `GET` | `/users/{user_id}` | Committed balance. 404 when this user has no balance yet. |
-| `GET` | `/users` | At most 100 users, most recently updated first. |
-| `GET` | `/health` | MongoDB and Redis. 503 when either is down. |
-| `GET` | `/` | Demo page. |
+   Poll the task, then read the balance. The balance is a string, for example `"25.00"`.
 
-`user_id` is 1–128 characters from `A–Z`, `a–z`, `0–9`, `_`, and `-`. `amount` is greater than 0, at most `1000000.00`, and has at most two decimal places.
+   ```bash
+   curl -s http://localhost:8000/credits/TASK_ID
+   curl -s http://localhost:8000/users/u_123
+   ```
 
-## Tests
+4. Run the tests. They write to the `credits_test` database and expect MongoDB and Redis on localhost.
 
-The suite expects MongoDB and Redis on localhost. Tests write to the `credits_test` database.
+   ```bash
+   docker compose up -d mongo redis
+   python3 -m venv .venv
+   .venv/bin/pip install -e '.[dev]'
+   .venv/bin/python -m pytest
+   ```
 
-```bash
-docker compose up -d mongo redis
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest
-```
-
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `MONGODB_URI` | MongoDB connection string. Compose uses `mongodb://mongo:27017/?replicaSet=rs0`. |
-| `MONGODB_DATABASE` | Database name. Default `credits`. |
-| `REDIS_URL` | Redis connection string. Compose uses `redis://redis:6379/0`. |
-| `PORT` | API port. Default `8000`. |
-
-Copy `.env.example` to `.env` to run the API on the host. The hostnames in that file resolve inside Compose. From the host, use `localhost`, and set `directConnection=true` because the replica-set member is advertised as `mongo`.
+To run the processes on the host instead of in Compose, copy `.env.example` to `.env` and point both commands at localhost. The replica-set member is advertised as `mongo`, so the host URI needs `directConnection=true`.
 
 ```bash
 MONGODB_URI='mongodb://localhost:27017/?directConnection=true' \
@@ -81,4 +68,35 @@ REDIS_URL='redis://localhost:6379/0' \
 .venv/bin/celery -A app.tasks worker --loglevel=info --concurrency=1
 ```
 
-The image is Python 3.11. On Python 3.14, add `--pool=solo` to that worker command. The prefork pool crashes on that version.
+The image is Python 3.11. On Python 3.14, add `--pool=solo` to that worker command.
+
+| Variable | Purpose |
+| --- | --- |
+| `MONGODB_URI` | MongoDB connection string. Compose uses `mongodb://mongo:27017/?replicaSet=rs0`. |
+| `MONGODB_DATABASE` | Database name. Default `credits`. |
+| `REDIS_URL` | Redis connection string. Compose uses `redis://redis:6379/0`. |
+| `PORT` | API port. Default `8000`. |
+
+`user_id` is 1–128 characters from `A–Z`, `a–z`, `0–9`, `_`, and `-`. `amount` is greater than 0, at most `1000000.00`, and has at most two decimal places.
+
+## Documentation
+
+The design note is the architecture discussion: the request flow, why status lives on the credit, how a redelivery is applied once, and the limits of this version.
+
+- [Design and architecture](docs/design.md)
+- [Design note (PDF)](docs/design.pdf)
+- Interactive request shapes: [http://localhost:8000/docs](http://localhost:8000/docs), or [/docs](https://basta-production-1b91.up.railway.app/docs) on the live demo
+
+## Tech Stack
+
+- **API**: FastAPI, Pydantic v2, Python 3.11
+- **Worker**: Celery 5. Redis is the broker. Celery stores no task result
+- **Database**: MongoDB. Balances are `Decimal128`. The apply step is one multi-document transaction, so MongoDB runs as a replica set
+- **Local runtime**: Docker Compose (`api`, `worker`, `mongo`, `redis`)
+- **Tests**: pytest. Unit tests use in-memory stand-ins. Integration tests use the Compose databases
+
+## Honest limits
+
+A crash after the credit is inserted and before it is published can leave it `processing` with nothing queued. Nothing sweeps that gap. Clients poll for completion. The balance is one increment on the user, not a ledger. There is no sign-in.
+
+The [design note](docs/design.md) covers these limits, and the choice of Redis over a heavier broker, in more detail.
